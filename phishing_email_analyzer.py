@@ -1,163 +1,155 @@
 import streamlit as st
-import os
 import email
 import re
-import hashlib
-import tempfile
+import base64
+import os
 import requests
+import unicodedata
+from fpdf import FPDF
+from email import policy
+from email.parser import BytesParser
 from dotenv import load_dotenv
-from urllib.parse import urlparse
-import tldextract
 
+# Load VirusTotal API key from .env
 load_dotenv()
-
 VT_API_KEY = os.getenv("VT_API_KEY")
 
+# Set Streamlit page config
+st.set_page_config(page_title="Phishing Email Analyzer", layout="centered")
+
+# 🔲 Theme toggle
+theme = st.sidebar.radio("🌗 Theme", ["Light", "Dark"])
+if theme == "Dark":
+    st.markdown("""
+        <style>
+        body { background-color: #111; color: white; }
+        .stApp { background-color: #111; }
+        </style>
+    """, unsafe_allow_html=True)
+
+# 🚩 Keywords often found in phishing
 PHISHING_KEYWORDS = [
-    "verify", "reset", "update", "login", "security alert", "account suspended",
-    "confirm", "urgent", "password", "click", "bank", "invoice", "payment",
-    "limited access", "locked", "unauthorized", "violation", "alert",
-    "final notice", "secure your account", "recover access", "credentials",
-    "dangerous", "warning", "verify your info", "your account", "deactivate"
+    "urgent", "verify", "account", "suspend", "limited", "unauthorized",
+    "security alert", "click here", "confirm", "password", "login", "update"
 ]
 
-SUSPICIOUS_DOMAINS = [
-    r"bit\.ly", r"tinyurl\.com", r"g00gle", r"paypa1", r"micros0ft",
-    r"update-info.*", r"cloud-secure.*", r"secure-mail.*", r"fast-login.*",
-    r"banksecure.*", r"auth-center.*", r"account-update.*"
-]
+# 🧽 Sanitize text for PDF
+def sanitize_text(text):
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
 
-TRIGGER_HEADERS = ["X-Priority", "X-MSMail-Priority", "Precedence", "List-Unsubscribe"]
+# 🧾 PDF export
+def generate_pdf_report(from_addr, subject, score, reasons, verdict):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
 
-st.set_page_config(page_title="Phishing Email Analyzer", layout="wide")
-st.title("📧 Phishing Email Detection & Deep Analysis Tool")
+    pdf.cell(200, 10, txt="Phishing Email Analysis Report", ln=True, align="C")
+    pdf.ln(10)
+    pdf.cell(200, 10, txt=f"From: {sanitize_text(from_addr)}", ln=True)
+    pdf.cell(200, 10, txt=f"Subject: {sanitize_text(subject)}", ln=True)
+    pdf.cell(200, 10, txt=f"Score: {score}%", ln=True)
+    pdf.cell(200, 10, txt=f"Verdict: {sanitize_text(verdict)}", ln=True)
 
-uploaded_file = st.file_uploader("Upload an .eml file", type=["eml"])
+    pdf.ln(10)
+    clean_reasons = [sanitize_text(r) for r in reasons]
+    pdf.multi_cell(0, 10, txt="Reasons:\n" + "\n".join(clean_reasons))
 
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".eml") as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        tmp_path = tmp_file.name
+    pdf.output("report.pdf")
 
-    with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
-        msg = email.message_from_file(f)
+    with open("report.pdf", "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+        href = f'<a href="data:application/octet-stream;base64,{b64}" download="report.pdf">📄 Download Analysis PDF</a>'
+        st.markdown(href, unsafe_allow_html=True)
 
-    headers = dict(msg.items())
+# 🧠 Scoring function
+def analyze_email(headers, body):
+    score = 0
+    reasons = []
+
+    # Check for suspicious headers
+    if headers.get("Return-Path") and headers.get("From"):
+        if headers.get("Return-Path") != headers.get("From"):
+            score += 3
+            reasons.append("🔴 Sender mismatch: Return-Path and From header differ")
+
+    # Keyword checks in subject or body
+    text_to_check = f"{headers.get('Subject', '')} {body}".lower()
+    for word in PHISHING_KEYWORDS:
+        if word in text_to_check:
+            score += 1
+            reasons.append(f"⚠️ Found keyword: '{word}'")
+
+    # VirusTotal scanning score
+    if VT_API_KEY:
+        attachments = [part for part in headers.walk() if part.get_content_disposition() == 'attachment']
+        for att in attachments:
+            content = att.get_payload(decode=True)
+            r = requests.post(
+                'https://www.virustotal.com/api/v3/files',
+                headers={'x-apikey': VT_API_KEY},
+                files={'file': (att.get_filename(), content)}
+            )
+            if r.status_code == 200:
+                result = r.json()
+                score += 3
+                reasons.append("🦠 VirusTotal: File flagged as suspicious")
+            break  # limit to 1 attachment
+
+    return min(score, 15), reasons
+
+# 📬 Email parser
+def parse_email(uploaded_file):
+    msg = BytesParser(policy=policy.default).parse(uploaded_file)
+    headers = msg
     body = ""
-    attachments = []
-    links = []
 
     if msg.is_multipart():
         for part in msg.walk():
-            content_type = part.get_content_type()
-            if content_type == "text/plain" and not part.get_filename():
-                body += part.get_payload(decode=True).decode(errors='ignore')
-            elif part.get_filename():
-                attachments.append(part)
+            ctype = part.get_content_type()
+            if ctype == 'text/plain':
+                body += part.get_payload(decode=True).decode(errors="ignore")
     else:
-        body = msg.get_payload(decode=True).decode(errors='ignore')
+        body = msg.get_payload(decode=True).decode(errors="ignore")
 
-    links = re.findall(r'https?://[\w./\-]+', body)
+    return headers, body
 
-    phishing_score = 0
-    reasons = []
+# 🚀 Main UI
+st.title("📧 Phishing Email Detection & Deep Analysis Tool")
+uploaded_file = st.file_uploader("Upload an .eml file to analyze", type=["eml"])
 
-    # Keyword scan
-    hits = [kw for kw in PHISHING_KEYWORDS if kw in body.lower()]
-    if hits:
-        reasons.append(f"🔴 Keywords matched: {', '.join(hits[:5])}")
-        phishing_score += len(hits) * 3
+if uploaded_file:
+    headers, body = parse_email(uploaded_file)
+    score, reasons = analyze_email(headers, body)
+    risk_percent = min(int((score / 15) * 100), 100)
 
-    # Suspicious domains and shorteners
-    for link in links:
-        domain = tldextract.extract(link).domain.lower()
-        for pattern in SUSPICIOUS_DOMAINS:
-            if re.search(pattern, link.lower()):
-                reasons.append(f"🔴 Suspicious link: {link}")
-                phishing_score += 4
-        if domain in ["bit", "tinyurl"] or domain.isnumeric() or any(c.isdigit() for c in domain):
-            reasons.append(f"⚠️ Shortened or fake domain used: {domain}")
-            phishing_score += 3
-
-    # Sender mismatch
-    if "Return-Path" in headers and "From" in headers:
-        if headers["Return-Path"].strip().lower() != headers["From"].strip().lower():
-            reasons.append("🔴 Header mismatch: Return-Path != From")
-            phishing_score += 3
-
-    # Spam headers
-    for h in TRIGGER_HEADERS:
-        if h in headers:
-            reasons.append(f"⚠️ Suspicious header: {h}")
-            phishing_score += 2
-
-    # SPF/DKIM failure
-    auth_results = headers.get("Authentication-Results", "").lower()
-    if any(x in auth_results for x in ["spf=fail", "spf=none", "dkim=fail", "dkim=none"]):
-        reasons.append("🔴 SPF/DKIM authentication failed or missing")
-        phishing_score += 4
-
-    # VirusTotal attachment scan
-    if VT_API_KEY and attachments:
-        for attachment in attachments:
-            filename = attachment.get_filename()
-            payload = attachment.get_payload(decode=True)
-            file_hash = hashlib.sha256(payload).hexdigest()
-            try:
-                vt_response = requests.get(
-                    f"https://www.virustotal.com/api/v3/files/{file_hash}",
-                    headers={"x-apikey": VT_API_KEY}
-                )
-                if vt_response.status_code == 200:
-                    data = vt_response.json()
-                    mal_count = data['data']['attributes']['last_analysis_stats']['malicious']
-                    if mal_count > 0:
-                        reasons.append(f"🔴 Attachment {filename} flagged by VirusTotal")
-                        phishing_score += 5
-            except:
-                st.warning(f"⚠️ VirusTotal lookup failed for {filename}")
-
-    # Risk label
-    st.subheader("📊 Final Analysis")
-    if phishing_score >= 7:
-        st.error("🚨 HIGH RISK: Likely phishing!")
-    elif phishing_score >= 4:
-        st.warning("⚠️ MEDIUM RISK: Suspicious elements found")
+    st.subheader("📊 Analysis Result")
+    if risk_percent >= 70:
+        st.error(f"❌ High Risk: Likely a phishing email")
+        verdict = "High Risk"
+    elif risk_percent >= 40:
+        st.warning("⚠️ Medium Risk: Suspicious elements found")
+        verdict = "Medium Risk"
     else:
-        st.success("✅ LOW RISK: No major signs, but always be cautious")
+        st.success("✅ Low Risk: Looks safe (but always verify manually)")
+        verdict = "Low Risk"
 
-    st.markdown("---")
-    st.subheader("🛡️ Indicators Found")
-    if reasons:
-        for r in reasons:
-            st.markdown(f"- {r}")
-    else:
-        st.markdown("- No major phishing indicators found.")
-
-    st.subheader("📬 Email Metadata")
-    st.text_area("From", headers.get("From", "N/A"), height=70)
-    st.text_area("Subject", headers.get("Subject", "N/A"), height=70)
-    st.text_area("Body Preview", body[:1000] + ("..." if len(body) > 1000 else ""), height=300)
-
-    if links:
-        st.subheader("🔗 Links Extracted")
-        for link in links:
-            st.markdown(f"- [{link}]({link})")
-
-    if attachments:
-        st.subheader("📎 Attachments")
-        for att in attachments:
-            st.markdown(f"- {att.get_filename()}")
-
-    # Risk percent normalization and visual
-    risk_percent = min(int((phishing_score / 15) * 100), 100)
+    st.markdown(f"**🧠 Risk Score: {risk_percent}%**")
     st.progress(risk_percent)
 
-    if risk_percent >= 70:
-        st.error(f"🚨 Normalized Risk Score: {risk_percent}%")
-    elif risk_percent >= 30:
-        st.warning(f"⚠️ Normalized Risk Score: {risk_percent}%")
-    else:
-        st.success(f"✅ Normalized Risk Score: {risk_percent}%")
+    st.subheader("🛡️ Reasons Detected")
+    for r in reasons:
+        st.markdown(r)
 
-    st.info(f"🧠 Final Score (raw): {phishing_score}")
+    st.subheader("📬 Email Details")
+    st.text_area("From", headers.get("From", "N/A"), height=70)
+    st.text_area("Subject", headers.get("Subject", "N/A"), height=70)
+    st.text_area("Email Body (Plain Text)", body, height=200)
+
+    # Generate PDF Report
+    generate_pdf_report(
+        from_addr=headers.get("From", "N/A"),
+        subject=headers.get("Subject", "N/A"),
+        score=risk_percent,
+        reasons=reasons,
+        verdict=verdict
+    )
